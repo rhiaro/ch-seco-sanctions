@@ -1,17 +1,14 @@
-URL="https://www.sesam.search.admin.ch/sesam-search-web/pages/downloadXmlGesamtliste.xhtml?lang=en&action=downloadXmlGesamtlisteAction"
-WORK_PATH=$(OPENNAMES_SOURCE_DATA)
-XML_FILE=$(WORK_PATH)/ch_seco_sanctions.xml
+all: test
 
-all: scrape parse
+build:
+	docker build --no-cache -t ch-seco-sanctions .
 
-$(XML_FILE):
-	mkdir -p $(WORK_PATH)
-	curl -o $(XML_FILE) $(URL)
-
-scrape: $(XML_FILE)
-
-parse: $(XML_FILE)
-	python parse.py $(XML_FILE)
+test: build
+	docker run -v $(PWD)/data:/data -e DATA_PATH=/data \
+		-e DATABASE_URI=sqlite:////data/data.sqlite \
+		-e AWS_ACCESS_KEY_ID=$(AWS_ACCESS_KEY_ID) \
+		-e AWS_SECRET_ACCESS_KEY=$(AWS_SECRET_ACCESS_KEY) \
+		ch-seco-sanctions
 
 clean:
-	rm $(XML_FILE)
+	rm -rf data

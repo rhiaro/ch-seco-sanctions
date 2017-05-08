@@ -7,6 +7,8 @@ from peplib import Source
 from peplib.util import make_id
 from peplib.text import combine_name
 
+URL = 'https://www.sesam.search.admin.ch/sesam-search-web/pages/downloadXmlGesamtliste.xhtml?lang=en&action=downloadXmlGesamtlisteAction'  # noqa
+
 source = Source('ch_seco')
 
 PUBLISHER = {
