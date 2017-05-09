@@ -1,21 +1,30 @@
-import sys
+import requests
+import logging
 from lxml import etree
 from datetime import date
-from itertools import combinations
 
-from peplib import Source
-from peplib.util import make_id
-from peplib.text import combine_name
+from libsanctions import Source, Entity, Alias
 
+log = logging.getLogger(__name__)
 URL = 'https://www.sesam.search.admin.ch/sesam-search-web/pages/downloadXmlGesamtliste.xhtml?lang=en&action=downloadXmlGesamtlisteAction'  # noqa
 
-source = Source('ch_seco')
+QUALITY = {
+    'good': Alias.QUALITY_STRONG,
+    'low': Alias.QUALITY_WEAK
+}
 
-PUBLISHER = {
-    'publisher': 'Swiss Secretariat for Economic Affairs (SECO)',
-    'publisher_url': 'http://www.seco.admin.ch/',
-    'source': 'Sanctions / Embargoes',
-    'source_url': 'http://www.seco.admin.ch/themen/00513/00620/04991/index.html?lang=en'
+NAME_PARTS = {
+    'family-name': 'last_name',
+    'given-name': 'first_name',
+    'further-given-name': 'second_name',
+    'father-name': 'father_name',
+    'whole-name': 'name',
+    'title': 'title',
+    'grand-father-name': 'third_name',
+    'tribal-name': 'last_name',
+    'maiden-name': None,
+    'other': None,
+    'suffix': None,
 }
 
 
@@ -35,174 +44,139 @@ def parse_date(el):
         return el.get('year')
 
 
-def parse_addr(addr, places):
-    if not len(addr.getchildren()):
-        addr = places.get(addr.get('place-id'))
-    country = addr.find('./country')
-    data = {
-        'text': addr.findtext('./remarks') or addr.findtext('./location'),
-        'address1': addr.findtext('./address-details'),
-        'address2': addr.findtext('./p-o-box'),
-        'postal_code': addr.findtext('./zip-code'),
-        'address1': addr.findtext('./address-details'),
-        'region': addr.findtext('./area'),
-        'country': source.normalize_country(addr.findtext('./country'))
-    }
-    if country is not None and country.get('iso-code'):
-        data['country'] = source.normalize_country(country.get('iso-code'))
-    return data
+def parse_address(entity, node, places):
+    if not len(node.getchildren()):
+        node = places.get(node.get('place-id'))
+    address = entity.create_address()
+    address.text = node.findtext('./location') or node.findtext('./c-o')
+    address.note = node.findtext('./remarks')
+    address.street = node.findtext('./address-details')
+    address.street_2 = node.findtext('./p-o-box')
+    address.postal_code = node.findtext('./zip-code')
+    address.region = node.findtext('./area')
+
+    country = node.find('./country')
+    if country is not None:
+        address.country = country.text
+        if country.get('iso-code'):
+            address.country_code = country.get('iso-code')
 
 
-def get_name_data(names):
-    data = {}
-    parts = []
-    for (name_part, value) in names:
-        np_type = name_part.get('name-part-type')
+def parse_name(entity, node, main):
+    quality = QUALITY[node.get('quality')]
+    obj = entity
+    if 'alias' == node.get('name-type') or not main:
+        obj = entity.create_alias()
+        obj.quality = quality
 
-        data['quality'] = name_part.getparent().get('quality')
-        if value and len(value) and value.strip() != '-':
-            if np_type == 'whole-name':
-                data['other_name'] = value
-            if np_type == 'family-name':
-                data['last_name'] = value
-            if np_type == 'given-name':
-                data['first_name'] = value
-            if np_type == 'further-given-name':
-                data['second_name'] = value
-            parts.append((value, int(name_part.get('order'))))
-
-    if 'other_name' not in data and len(parts):
-        parts = sorted(parts, key=lambda (a, b): b)
-        parts = [a for (a, b) in parts]
-        data['other_name'] = combine_name(*parts)
-
-    return data
-
-
-def parse_name(name, record, main):
-    primary = name.get('name-type') == 'primary-name'
-    is_alias = not primary
-    if 'name' in record and not main:
-        is_alias = True
-
-    names = []
-    name_parts = name.findall('./name-part')
-    for name_part in name_parts:
-        value = name_part.findtext('./value')
-        names.append((name_part, value))
-    data = get_name_data(names)
-    if is_alias:
-        record['other_names'].append(data)
-    else:
-        record['name'] = data.pop('other_name')
-
-    variants = []
-    for name_part in name_parts:
-        for var in name_part.findall('./spelling-variant'):
-            variants.append((name_part, var))
-
-    for name_cand in combinations(variants, len(name_parts)):
-        langs = set([v.get('lang') for (np, v) in name_cand])
-        if len(langs) > 1:
-            continue
-        scripts = set([v.get('script') for (np, v) in name_cand])
-        if len(scripts) > 1:
-            continue
-        types = set([np.get('name-part-type') for (np, v) in name_cand])
-        if len(types) != len(name_cand):
+    variants = {}
+    for part_node in node.findall('./name-part'):
+        part_type = NAME_PARTS[part_node.get('name-part-type')]
+        if part_type is None:
             continue
 
-        names = [(np, v.text) for (np, v) in name_cand]
-        # print [(np.get('name-part-type'), v) for (np, v) in names]
-        record['other_names'].append(get_name_data(names))
+        value = part_node.findtext('./value')
+        setattr(obj, part_type, value)
+
+        for spelling in part_node.findall('./spelling-variant'):
+            key = (spelling.get('lang'), spelling.get('script'))
+            if key not in variants:
+                variants[key] = entity.create_alias()
+            setattr(variants[key], part_type, spelling.text)
 
 
-def parse_identity(record, ident, places):
-    main = ident.get('main') == 'true'
-    # print ident, record['type'], record['program']
+def parse_identity(entity, node, places):
+    main = node.get('main') == 'true'
 
-    for name in ident.findall('./name'):
-        parse_name(name, record, main)
+    for name_node in node.findall('./name'):
+        parse_name(entity, name_node, main)
 
-    for dob in ident.findall('./day-month-year'):
-        if main or 'date_of_birth' not in record:
-            record['date_of_birth'] = parse_date(dob)
+    for address_node in node.findall('./address'):
+        parse_address(entity, address_node, places)
 
-    for pob in ident.findall('./place-of-birth'):
-        addr = parse_addr(pob, places)
-        parts = [addr.get('text'), addr.get('address1'), addr.get('address2'),
-                 addr.get('city'), addr.get('region')]
-        parts = [p for p in parts if p is not None]
-        if main or 'place_of_birth' not in record:
-            if len(parts):
-                record['place_of_birth'] = ' / '.join(parts)
-        if main or 'country_of_birth' not in record:
-            if addr.get('country'):
-                record['country_of_birth'] = addr.get('country')
+    for bday_node in node.findall('./day-month-year'):
+        birth_date = entity.create_birth_date()
+        birth_date.date = parse_date(bday_node)
+        birth_date.quality = QUALITY[bday_node.get('quality')]
 
-    for addr in ident.findall('./address'):
-        record['addresses'].append(parse_addr(addr, places))
+    for place_node in node.findall('./place-of-birth'):
+        res_place = places.get(place_node.get('place-id'))
+        if place_node is None:
+            log.warning("Invalid place ref: %s", place_node.get('place-id'))
+            continue
 
-    for doc in ident.findall('./identification-document'):
+        birth_place = entity.create_birth_place()
+        birth_place.quality = QUALITY[place_node.get('quality')]
+        birth_place.place = res_place.findtext('./location')
+        area = res_place.findtext('./area')
+        if area is not None:
+            if birth_place.place is not None:
+                birth_place.place = '%s; %s' % (birth_place.place, area)
+            else:
+                birth_place.place = area
+
+        country = res_place.find('./country')
+        if country is not None:
+            birth_place.country = country.text
+            if country.get('iso-code') is not None:
+                birth_place.country_code = country.get('iso-code')
+
+    for doc in node.findall('./identification-document'):
+        identifier = entity.create_identifier()
+        identifier.number = doc.findtext('./number')
+        identifier.description = doc.get('document-type')
         country = doc.find('./issuer')
         if country is not None:
+            identifier.country = country.text
             if country.get('code'):
-                country = source.normalize_country(country.get('code'))
-            else:
-                country = source.normalize_country(country.text)
-
-        record['identities'].append({
-            'country': country,
-            'type': doc.get('document-type'),
-            'number': doc.findtext('./number'),
-        })
+                identifier.country_code = country.get('code')
 
 
-def parse_entry(doc, target, sanctions, places):
+def parse_entry(source, target, updated_at, sanctions, places):
     node = target.find('./individual')
+    type_ = Entity.TYPE_INDIVIDUAL
     if node is None:
         node = target.find('./entity')
+        type_ = Entity.TYPE_ENTITY
     if node is None:
-        node = target.find('./object')
+        # node = target.find('./object')
         # TODO: build out support for these!
         return
 
-    record = {
-        'uid': make_id('ch', 'seco', target.get('ssid')),
-        'type': node.tag,
-        'updated_at': doc.getroot().get('date'),
-        'program': sanctions.get(target.get('sanctions-set-id')),
-        'function': node.findtext('./other-information'),
-        'summary': node.findtext('./justification'),
-        'other_names': [],
-        'addresses': [],
-        'identities': []
-    }
-    record.update(PUBLISHER)
-    for ident in node.findall('./identity'):
-        parse_identity(record, ident, places)
+    entity = source.create_entity(target.get('ssid'))
+    entity.type = type_
+    entity.updated_at = updated_at
+    entity.program = sanctions.get(target.get('sanctions-set-id'))
+    entity.function = node.findtext('./other-information')
+    entity.summary = node.findtext('./justification')
 
-    # from pprint import pprint
-    # pprint(record)
-    source.emit(record)
+    for inode in node.findall('./identity'):
+        parse_identity(entity, inode, places)
+
+    entity.save()
 
 
-def seco_parse(xmlfile):
-    doc = etree.parse(xmlfile)
+def seco_parse():
+    res = requests.get(URL, stream=True)
+    doc = etree.parse(res.raw)
+    source = Source('ch-seco-sanctions')
+    updated_at = doc.getroot().get('date')
 
-    sanctions = {}
+    programs = {}
     for sanc in doc.findall('.//sanctions-program'):
         key = sanc.find('./sanctions-set').get('ssid')
         label = sanc.findtext('./program-name[@lang="eng"]')
-        sanctions[key] = label
+        programs[key] = label
 
     places = {}
     for place in doc.findall('.//place'):
         places[place.get('ssid')] = place
 
     for target in doc.findall('./target'):
-        parse_entry(doc, target, sanctions, places)
+        parse_entry(source, target, updated_at, programs, places)
+
+    source.finish()
 
 
 if __name__ == '__main__':
-    seco_parse(sys.argv[1])
+    seco_parse()
