@@ -29,7 +29,7 @@ NAME_PARTS = {
 
 
 def parse_date(el):
-    if el is None:
+    if el is None or not el.get('year'):
         return
     if el.get('month') and el.get('day'):
         try:
