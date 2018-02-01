@@ -3,10 +3,21 @@ import logging
 from lxml import etree
 from datetime import date
 
-from libsanctions import Source, Entity, Alias
+from libsanctions import Source, Entity, Alias, Identifier
 
 log = logging.getLogger(__name__)
 URL = 'https://www.sesam.search.admin.ch/sesam-search-web/pages/downloadXmlGesamtliste.xhtml?lang=en&action=downloadXmlGesamtlisteAction'  # noqa
+
+ID_TYPES = {
+    'diplomatic-passport': Identifier.TYPE_PASSPORT,
+    'driving-license': Identifier.TYPE_OTHER,
+    'driving-permit': Identifier.TYPE_OTHER,
+    'id-card': Identifier.TYPE_NATIONALID,
+    'other': Identifier.TYPE_OTHER,
+    'passport': Identifier.TYPE_PASSPORT,
+    'resident-permit': Identifier.TYPE_OTHER,
+    'travel-document': Identifier.TYPE_PASSPORT
+}
 
 QUALITY = {
     'good': Alias.QUALITY_STRONG,
@@ -125,6 +136,7 @@ def parse_identity(entity, node, places):
         identifier = entity.create_identifier()
         identifier.number = doc.findtext('./number')
         identifier.description = doc.get('document-type')
+        identifier.type = ID_TYPES[identifier.description] 
         country = doc.find('./issuer')
         if country is not None:
             identifier.country = country.text
